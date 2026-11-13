@@ -1,0 +1,9 @@
+{
+  "location": "Lubbock, TX",
+  "asOf": "2026-11-02",
+  "prices": [],
+  "candidates": [],
+  "mode": "review_first",
+  "status": {"Food King": "Collector has not run on a connected host yet", "United": "Collector has not run on a connected host yet"},
+  "disclaimer": "No verified local meat prices have been collected yet."
+}
