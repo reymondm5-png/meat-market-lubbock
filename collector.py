@@ -2,7 +2,7 @@
 """Conservative weekly-ad candidate collector for Lubbock Meat Market.
 
 No passwords, no proxies, no retailer authentication, no guessed prices. It reads
-public third-party ad summaries where permitted and emits unverified suggestions;
+public third-party ad summaries where permitted and emits unverified priced leads;
 only positively validated store-specific data should ever be emitted in `prices`.
 """
 import argparse
@@ -20,8 +20,10 @@ from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
 FOOD_KING = "https://foodking.weeklyad.us.com/"
+UNITED_LOCAL = "https://dealhivemind.com/weekly-ads/lubbock-tx/united-supermarket/"
 UNITED_INDEX = "https://www.weeklyads.now/united-supermarkets"
-UA = "MeatMarketPersonalPriceTracker/1.3 (+weekly public ad summary; once daily)"
+LUBBOCK_PRICE_SUMMARY = "https://lowtein.com/us/tx/lubbock"
+UA = "MeatMarketPersonalPriceTracker/1.5 (+weekly public ad summary; once daily)"
 TARGET = ("Food King", "United")
 
 
@@ -83,22 +85,35 @@ def food_king_candidates(html, today):
         return [], "Ad dates unavailable or not valid today; no prices accepted"
     # Table must explicitly declare the header names, avoiding unrelated tables.
     result = []
+    rows_seen = 0
+    meat_rows = 0
+    matched_rows = 0
+    product_tables = 0
     for table in soup.select("table"):
         heads = [h.get_text(" ", strip=True).lower() for h in table.select("th")]
         if not all(k in heads for k in ("product", "price", "unit", "category")):
             continue
+        product_tables += 1
         ix = {key: heads.index(key) for key in ("product", "price", "unit", "category")}
         for tr in table.select("tr"):
             cells = tr.find_all("td")
             if len(cells) <= max(ix.values()):
                 continue
+            rows_seen += 1
             cat = cells[ix["category"]].get_text(" ", strip=True).upper()
             if cat != "MEAT":
                 continue
+            meat_rows += 1
             product = cells[ix["product"]].get_text(" ", strip=True)
             meat = classify(product)
             if not meat:
+                # Some flyers specify the cut in the Product column and
+                # 'boneless, skinless' in the Brand column.
+                brand = cells[heads.index("brand")].get_text(" ", strip=True) if "brand" in heads else ""
+                meat = classify(product + " " + brand)
+            if not meat:
                 continue
+            matched_rows += 1
             price_text = cells[ix["price"]].get_text(" ", strip=True)
             unit = cells[ix["unit"]].get_text(" ", strip=True)
             p = price_per_lb(price_text)
@@ -112,8 +127,157 @@ def food_king_candidates(html, today):
                            "date": today.isoformat(), "saleEnds": window[1].isoformat(),
                            "pricePerLb": p, "priceIncludesMarkup": False,
                            "source": FOOD_KING, "reviewRequired": True,
-                           "notes": "UNOFFICIAL flyer summary, not a confirmed Lubbock price. Food King adds 10% at checkout."})
-    return result, f"Parsed {len(result)} explicit $/lb suggestions; verify at 8208 Slide Rd"
+                           "notes": "UNOFFICIAL regional flyer; $/lb is printed but not confirmed at 8208 Slide Rd. Food King adds a 10% checkout fee. IQF means individually quick frozen."})
+    return result, (f"Food King source checked: {product_tables} product tables, {rows_seen} product rows, "
+                    f"{meat_rows} meat rows, {matched_rows} target cuts, "
+                    f"{len(result)} usable /lb prices. Unverified regional ads; check 8208 Slide Rd.")
+
+
+def united_lubbock_priced_leads(html, today):
+    """Extract ONLY explicit $/lb ads assigned to United from Lubbock listings.
+
+    Source is an independent ad aggregator. Output remains review-required.
+    A historical price mentioned in the article is NEVER a current lead.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    if "Lubbock" not in text[:2500] or "United Supermarkets" not in text:
+        return [], "Not a Lubbock/United price listing"
+    # The public site says 'thru Tue, Nov 17' in the active-deals header.
+    m = re.search(r"\bthru\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s*,?\s*([A-Za-z]{3,9})\s+(\d{1,2})\b", text[:3000], re.I)
+    if not m:
+        return [], "Current ad expiry not found; rejected stale/unverifiable prices"
+    expiry = None
+    for year in (today.year, today.year + 1):
+        try:
+            candidate = dt.datetime.strptime(f"{m[1][:3]} {m[2]} {year}", "%b %d %Y").date()
+            if today <= candidate <= today + dt.timedelta(days=10):
+                expiry = candidate
+                break
+        except ValueError:
+            pass
+    if expiry is None:
+        return [], "Lubbock deal expiry does not cover today"
+
+    # Link text on page two is store-scoped; reject generic city-wide
+    # category rows where another retailer might have the same price.
+    matching_links = []
+    for a in soup.find_all("a", href=True):
+        hostname = urllib.parse.urlparse(a["href"]).hostname or ""
+        if hostname.lower().removeprefix("www.") != "unitedsupermarkets.com":
+            continue
+        label = a.get_text(" ", strip=True)
+        if "/lb" in label.lower():
+            matching_links.append(label)
+
+    # The page's public text also has a Shop by Store listing. It should
+    # be used ONLY if the United heading and a subsequent store heading
+    # both exist, to prevent cross-store prices being misattributed.
+    if not matching_links and "Shop by Store" in text:
+        section = text.split("Shop by Store",1)[1]
+        match = re.search(r"\bUnited Supermarkets\b(.{0,1800}?)(?=\b(?:H-E-B|Sprouts Farmers Market|Market Street|Amigos United)\b|\bFAQ\b|$)", section, re.I | re.S)
+        if match:
+            matching_links=[match.group(1)]
+
+    results = []
+    for label in matching_links:
+        # Examples: "Ground Beef$3.97/lb signature select 80% lean ground beef"
+        for m in re.finditer(r"(Chicken Breast|Ground Beef|Pork Chops|Boneless Chuck Roast)\s*\$\s*(\d{1,3}\.\d{2})\s*/\s*lb\s+(.{3,120}?)(?=\s+(?:Chicken Breast|Ground Beef|Pork Chops|Boneless Chuck Roast)\s*\$|\s+\d+%\s+below|$)", label, re.I):
+            category = {"chicken breast":"Chicken breast","ground beef":"Ground beef","pork chops":"Pork chops","boneless chuck roast":"Boneless chuck roast"}[m[1].casefold()]
+            amount = float(m[2])
+            if not 0.1 <= amount <= 100:
+                continue
+            product = re.sub(r"\s+", " ", m[3]).strip(" ·-★")[:125]
+            # Avoid attributing an ad to the wrong cut (e.g., pork tenderloin).
+            if not classify(product) == category:
+                continue
+            results.append({"store":"United","meat":category,"product":product,
+                "date":today.isoformat(),"saleEnds":expiry.isoformat(),
+                "pricePerLb":amount,"priceIncludesMarkup":True,
+                "source":LUBBOCK_PRICE_SUMMARY,"reviewRequired":True,
+                "notes":"Independent Lubbock weekly-ad aggregator; advertised $/lb, NOT verified at United 8010 Frankford Ave. Confirm in the official ad before saving."})
+    unique = {(r["meat"],r["product"].casefold(),r["pricePerLb"]): r for r in results}
+    return list(unique.values()), f"Lubbock aggregator expires {expiry}: {len(unique)} explicit $/lb United leads (UNVERIFIED)"
+
+
+def united_lubbock_candidates(html, today):
+    """Read public Lubbock-area flyer text, extracting item names for manual review.
+
+    Advertised amounts are *not* recorded because flyer extraction omits whether
+    a number is per item, per pack, or per pound. Unlike the old directory source,
+    this explicitly names the Lubbock region. It remains an unofficial listing.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    txt = soup.get_text(" ", strip=True)
+    if "Lubbock" not in txt[:2500] or "United" not in txt[:2500]:
+        return [], "Lubbock location not identified; rejected source"
+    dates = re.search(r"Current Ad Valid through\s+([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(20\d{2})", txt, re.I)
+    if not dates:
+        return [], "Current flyer expiry not identified; rejected source"
+    try:
+        end = dt.datetime.strptime(f"{dates[1][:3]} {dates[2]} {dates[3]}", "%b %d %Y").date()
+    except ValueError:
+        return [], "Invalid expiry date in Lubbock flyer; rejected source"
+    if not (end - dt.timedelta(days=14) <= today <= end):
+        return [], f"Local flyer not current (ends {end.isoformat()}); rejected source"
+    # Only accept short visible strings corresponding to individual item titles.
+    # Ignore site descriptions or huge containers to avoid accidental matches.
+    unique = {}
+    for value in soup.stripped_strings:
+        product = " ".join(value.split())
+        if not 8 <= len(product) <= 115 or "\n" in product:
+            continue
+        meat = classify(product)
+        if not meat:
+            continue
+        if not re.search(r"[A-Za-z]", product):
+            continue
+        k = (meat, product.casefold())
+        unique[k] = {"store":"United", "meat": meat, "product":product,
+                     "date":today.isoformat(), "saleEnds":end.isoformat(),
+                     "source": UNITED_LOCAL, "reviewRequired":True,
+                     "notes":"Unofficial Lubbock-area flyer listing. Product ONLY; price /lb, package and store availability NOT verified. Check United 8010 Frankford Ave."}
+    n = re.search(r"(\d{1,4}) items extracted", txt, re.I)
+    count = n[1] if n else "unknown"
+    return list(unique.values())[:35], (f"Lubbock-area listing read ({count} advertised items reported); "
+                                      f"{len(unique)} tracked product names matched; prices not verified per lb")
+
+
+def united_directory_candidates(getter, today):
+    """Fallback: scan all pages of one third-party regional flyer, not just page 1.
+
+    This source may be for Pecos/another Texas region. It is never used to
+    assert local Lubbock prices. It is useful only as potential leads.
+    """
+    idx = getter(UNITED_INDEX)
+    flyer = discover_united_url(idx)
+    if not flyer:
+        return [], "No current regional flyer in the fallback index"
+    first = getter(flyer)
+    soup = BeautifulSoup(first, "html.parser")
+    found = re.search(r"(\d{1,2}) pages", soup.get_text(" ", strip=True)[:600])
+    pages = min(int(found[1]) if found else 1, 12)
+    location = soup.get_text(" ", strip=True)
+    match = re.search(r"Nearest store (.{3,65}?) \d+ mi away", location)
+    area = match[1] if match else "unknown region"
+    all_rows = []
+    errors = []
+    for n in range(1, pages+1):
+        try:
+            html = first if n == 1 else getter(flyer.rstrip('/') + f'/page/{n}')
+            rows, status = united_candidates(html, flyer, today)
+            all_rows.extend(rows)
+        except Exception as exc:
+            errors.append(f"page {n}: {type(exc).__name__}")
+    # Deduplicate repeated titles in different pages.
+    unique = {(r['meat'], r['product'].casefold()):r for r in all_rows}
+    for r in unique.values():
+        r['notes'] = (f"REGIONAL flyer ({area}); NOT verified for Lubbock. "
+                      "Price and /lb unit missing. Check United 8010 Frankford Ave.")
+    return list(unique.values())[:35], (f"Regional fallback {area}: checked {pages} pages, "
+                                      f"{len(unique)} tracked products; "
+                                      + (f"{len(errors)} pages had errors" if errors else "no page errors")
+                                      + "; not confirmed local prices")
 
 
 def united_window(soup, today):
@@ -162,7 +326,7 @@ def discover_united_url(index_html):
 
 def public_get(url, wait=1.0):
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname not in {"foodking.weeklyad.us.com", "www.weeklyads.now"}:
+    if parsed.scheme != "https" or parsed.hostname not in {"foodking.weeklyad.us.com", "www.weeklyads.now", "dealhivemind.com", "lowtein.com"}:
         raise ValueError("Only approved public HTTPS sources allowed")
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     rp = urllib.robotparser.RobotFileParser()
@@ -194,16 +358,31 @@ def run(today=None, getter=public_get):
     except Exception as exc:
         notes["Food King"] = f"Source unavailable: {type(exc).__name__}: {exc}"
     try:
-        idx = getter(UNITED_INDEX)
-        flyer = discover_united_url(idx)
-        if not flyer:
-            notes["United"] = "No current flyer link found in public directory"
-        else:
-            rows, status = united_candidates(getter(flyer), flyer, today)
-            candidates.extend(rows)
-            notes["United"] = status
+        rows, status = united_lubbock_candidates(getter(UNITED_LOCAL), today)
+        if not status.startswith("Lubbock-area listing read"):
+            raise RuntimeError(status)
+        candidates.extend(rows)
+        notes["United"] = status
     except Exception as exc:
-        notes["United"] = f"Source unavailable: {type(exc).__name__}: {exc}"
+        # An explicitly local flyer is preferable. If unavailable, fall back
+        # to a regional source ONLY as unverified leads.
+        local_error = f"{type(exc).__name__}: {exc}"
+        try:
+            rows, status = united_directory_candidates(getter, today)
+            candidates.extend(rows)
+            notes["United"] = status + f". Local listing unavailable: {local_error[:140]}"
+        except Exception as exc2:
+            notes["United"] = (f"No accessible local or regional flyer. "
+                               f"Local: {local_error[:130]}; regional: {type(exc2).__name__}: {str(exc2)[:130]}")
+    try:
+        rows, status = united_lubbock_priced_leads(getter(LUBBOCK_PRICE_SUMMARY), today)
+        candidates.extend(rows)
+        notes["United priced leads"] = status
+    except Exception as exc:
+        notes["United priced leads"] = f"Unavailable: {type(exc).__name__}: {str(exc)[:160]}"
+    # When both a priced and unpriced listing exist for the SAME item,
+    # leave the valued one first, but do not silently infer product equivalence.
+    candidates.sort(key=lambda c: ("pricePerLb" not in c, c["store"], c["meat"]))
     unique = {}
     for c in candidates:
         key = (c["store"], c["meat"], c["product"], c["source"], c["saleEnds"])
@@ -211,8 +390,8 @@ def run(today=None, getter=public_get):
     return {"location": "Lubbock, TX", "asOf": today.isoformat(),
             "prices": [],  # NEVER autopublish unverified third-party items as local shelf prices
             "candidates": list(unique.values())[:60],
-            "status": notes, "mode": "review_first",
-            "disclaimer": "These are unofficial regional-ad suggestions, NOT confirmed local store prices. Verify the official Lubbock ad before saving."}
+            "status": notes, "mode": "review_first", "version": "1.5",
+            "disclaimer": "These are unverified advertised prices/leads from independent weekly-ad sites, NOT confirmed local shelf prices. Verify each price and unit at the Lubbock store. Only verified prices may be saved to the comparison."}
 
 
 def main():
